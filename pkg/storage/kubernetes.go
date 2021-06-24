@@ -360,9 +360,6 @@ func IPManagementKubernetes(mode int, ipamConf whereaboutstypes.IPAMConfig, cont
 func IPManagementKubernetesUpdate(mode int, ipam *KubernetesIPAM, ipamConf whereaboutstypes.IPAMConfig, containerID string, podRef string) (net.IPNet, error) {
 	logging.Debugf("IPManagement -- mode: %v / containerID: %v / podRef: %v", mode, containerID, podRef)
 
-	//XXX
-	logging.Debugf("XXX wait for 10 sec")
-	time.Sleep(time.Second * 10)
 	now := time.Now()
 
 	var newip net.IPNet
