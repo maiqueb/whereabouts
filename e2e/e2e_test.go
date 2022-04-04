@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 	"github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
-	v1 "k8s.io/api/apps/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -27,16 +28,22 @@ import (
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/api/whereabouts.cni.cncf.io/v1alpha1"
 	wbclient "github.com/k8snetworkplumbingwg/whereabouts/pkg/client/clientset/versioned"
 	wbstorage "github.com/k8snetworkplumbingwg/whereabouts/pkg/storage/kubernetes"
+	"github.com/k8snetworkplumbingwg/whereabouts/pkg/types"
 )
 
 const (
-	testNetworkName = "wa-nad"
-	testNamespace   = "default"
-	testImage       = "quay.io/dougbtv/alpine:latest"
-	ipv4TestRange   = "10.10.0.0/16"
-	singlePodName   = "whereabouts-basic-test"
-	createTimeout   = 10 * time.Second
-	deleteTimeout   = 2 * createTimeout
+	wbLabelEqual     = "tier=whereabouts-scale-test"
+	testNamespace    = "default"
+	createTimeout    = 10 * time.Second
+	deleteTimeout    = 2 * createTimeout
+	rsCreateTimeout  = 600 * time.Second
+	podCreateTimeout = 10 * time.Second
+	podDeleteTimeout = 2 * podCreateTimeout
+	ipv4TestRange    = "10.10.0.0/16"
+	testNetworkName  = "wa-nad"
+	testImage        = "quay.io/dougbtv/alpine:latest"
+	rsName           = "whereabouts-scale-test"
+	ipPoolName       = "10.10.0.0/16"
 )
 
 func TestWhereaboutsE2E(t *testing.T) {
@@ -48,12 +55,22 @@ var _ = Describe("Whereabouts functionality", func() {
 	Context("Test setup", func() {
 		var (
 			clientInfo   *ClientInfo
+			testConfig   *envVars
 			netAttachDef *nettypes.NetworkAttachmentDefinition
 			pod          *core.Pod
+			replicaSet   *appsv1.ReplicaSet
 		)
 
 		BeforeEach(func() {
-			config, err := clusterConfig()
+			var (
+				config *rest.Config
+				err    error
+			)
+
+			testConfig, err = environment()
+			Expect(err).NotTo(HaveOccurred())
+
+			config, err = clusterConfig(testConfig.kubeconfigPath)
 			Expect(err).NotTo(HaveOccurred())
 
 			clientInfo, err = NewClientInfo(config)
@@ -72,8 +89,10 @@ var _ = Describe("Whereabouts functionality", func() {
 
 		Context("Single pod tests", func() {
 			BeforeEach(func() {
-				By("creating a pod with whereabouts net-attach-def")
+				const singlePodName = "whereabouts-basic-test"
 				var err error
+
+				By("creating a pod with whereabouts net-attach-def")
 				pod, err = clientInfo.provisionPod(
 					podTierLabel(singlePodName),
 					podNetworkSelectionElements(testNetworkName),
@@ -281,6 +300,66 @@ var _ = Describe("Whereabouts functionality", func() {
 				})
 			})
 		})
+
+		Context("Replicaset tests", func() {
+
+			const (
+				emptyReplicaSet = 0
+				rsSteadyTimeout = 2 * rsCreateTimeout
+			)
+
+			var k8sIPAM *wbstorage.KubernetesIPAM
+
+			BeforeEach(func() {
+				By("creating a replicaset with whereabouts net-attach-def")
+				var err error
+
+				const ipPoolNamespace = "kube-system"
+				k8sIPAM, err = wbstorage.NewKubernetesIPAMWithNamespace("", types.IPAMConfig{
+					Kubernetes: types.KubernetesConfig{
+						KubeConfigPath: testConfig.kubeconfigPath,
+					},
+				}, ipPoolNamespace)
+				Expect(err).NotTo(HaveOccurred())
+
+				replicaSet, err = clientInfo.provisionReplicaSet(
+					emptyReplicaSet,
+					podTierLabel(rsName),
+					podNetworkSelectionElements(testNetworkName),
+				)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterEach(func() {
+				By("removing replicas and expecting 0 IP pool allocations")
+				Expect(checkZeroIPPoolAllocationsAndReplicas(clientInfo, k8sIPAM, rsName, testNamespace)).To(Succeed())
+
+				By("deleting replicaset with whereabouts net-attach-def")
+				Expect(clientInfo.deleteReplicaSet(replicaSet)).To(Succeed())
+			})
+
+			It("allocates each IP pool entry with a unique pod IP", func() {
+				By("creating max number of pods and checking IP Pool validity")
+				for i := 0; i < testConfig.numThrashIter; i++ {
+					Expect(checkZeroIPPoolAllocationsAndReplicas(clientInfo, k8sIPAM, rsName, testNamespace)).To(Succeed())
+
+					// Increase to desired number of replicas for test
+					allPods, err := clientInfo.Client.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
+					Expect(err).NotTo(HaveOccurred())
+
+					replicaSet, err = clientInfo.updateReplicaSet(replicaSetObject(
+						testConfig.maxReplicas(allPods.Items),
+						podTierLabel(rsName),
+						podNetworkSelectionElements(testNetworkName),
+					))
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(WaitForReplicaSetSteadyState(clientInfo.Client, testNamespace, wbLabelEqual, replicaSet, rsSteadyTimeout)).To(Succeed())
+
+					Expect(iPPoolConsistency(k8sIPAM, clientInfo.Client)).To(Succeed())
+				}
+			})
+		})
 	})
 })
 
@@ -293,19 +372,162 @@ func allocationForPodRef(podRef string, ipPool v1alpha1.IPPool) *v1alpha1.IPAllo
 	return nil
 }
 
-func clusterConfig() (*rest.Config, error) {
-	const kubeconfig = "KUBECONFIG"
-
-	kubeconfigPath, found := os.LookupEnv(kubeconfig)
-	if !found {
-		return nil, fmt.Errorf("must provide the path to the kubeconfig via the `KUBECONFIG` env variable")
-	}
-
+func clusterConfig(kubeconfigPath string) (*rest.Config, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	if err != nil {
 		return nil, err
 	}
 	return config, nil
+}
+
+func iPPoolConsistency(k8sIPAM *wbstorage.KubernetesIPAM, cs *kubernetes.Clientset) error {
+	By("checking if there are any stale IPs in IP pool or any IPs in IP pool that are not seen attached to a pod")
+
+	By("Comparing pod ip assignments to ippool reservations")
+	ipPool, err := k8sIPAM.GetIPPool(context.Background(), ipPoolName)
+	if err != nil {
+		return err
+	}
+
+	ipPoolAllocations := ipPool.Allocations()
+	podList, err := ListPods(cs, testNamespace, wbLabelEqual)
+	if err != nil {
+		return err
+	}
+
+	if err := findStaleIPAddresses(ipPoolAllocations, podList); err != nil {
+		return err
+	}
+
+	if err := findMissingAllocations(ipPoolAllocations, podList); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func findStaleIPAddresses(ipPoolAllocations []types.IPReservation, podList *core.PodList) error {
+	var found bool
+	var podIP, reservedIP string
+	var err error
+
+	for _, allocation := range ipPoolAllocations {
+		found = false
+		for _, pod := range podList.Items {
+			podIP, err = secondaryIfaceIPValue(&pod)
+			if err != nil {
+				return err
+			}
+			reservedIP = allocation.IP.String()
+
+			if reservedIP == podIP {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("Possible stale IP Pool: failed to find pod for IP Pool IP %s\n", allocation.IP)
+		}
+	}
+
+	return nil
+}
+
+func findMissingAllocations(ipPoolAllocations []types.IPReservation, podList *core.PodList) error {
+	var found bool
+	var podIP, reservedIP string
+	var err error
+
+	for _, pod := range podList.Items {
+		found = false
+		for _, allocation := range ipPoolAllocations {
+			podIP, err = secondaryIfaceIPValue(&pod)
+			if err != nil {
+				return err
+			}
+			reservedIP = allocation.IP.String()
+
+			if reservedIP == podIP {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return fmt.Errorf("possible pod IP not recorded in IP pool: failed to find IP pool allocation for pod IP %s\n", podIP)
+		}
+	}
+
+	return nil
+}
+
+type envVars struct {
+	kubeconfigPath      string
+	numComputeNodes     int
+	fillPercentCapacity int
+	numThrashIter       int
+}
+
+func environment() (*envVars, error) {
+	var err error
+
+	kubeconfigPath := kubeConfig()
+	numComputeNodes, err := computeNodes()
+	if err != nil {
+		return nil, err
+	}
+	fillPercentCapacity, err := fillPercent()
+	if err != nil {
+		return nil, err
+	}
+	numThrashIter, err := thrashIter()
+	if err != nil {
+		return nil, err
+	}
+
+	return &envVars{
+		kubeconfigPath:      kubeconfigPath,
+		numComputeNodes:     numComputeNodes,
+		fillPercentCapacity: fillPercentCapacity,
+		numThrashIter:       numThrashIter,
+	}, nil
+}
+
+func kubeConfig() string {
+	const kubeconfig = "KUBECONFIG"
+	kubeconfigPath, found := os.LookupEnv(kubeconfig)
+	if !found {
+		kubeconfigPath = "${HOME}/.kube/config"
+	}
+	return kubeconfigPath
+}
+
+func computeNodes() (int, error) {
+	const numCompute = "NUMBER_OF_COMPUTE_NODES"
+	numComputeNodes, found := os.LookupEnv(numCompute)
+	if !found {
+		numComputeNodes = "2"
+	}
+	return strconv.Atoi(numComputeNodes)
+}
+
+func fillPercent() (int, error) {
+	const fillCapcity = "FILL_PERCENT_CAPACITY"
+	fillPercentCapacity, found := os.LookupEnv(fillCapcity)
+	if !found {
+		fillPercentCapacity = "50"
+	}
+	return strconv.Atoi(fillPercentCapacity)
+}
+
+func thrashIter() (int, error) {
+	const numThrash = "NUMBER_OF_THRASH_ITER"
+	numThrashIter, found := os.LookupEnv(numThrash)
+	if !found {
+		numThrashIter = "1"
+	}
+	return strconv.Atoi(numThrashIter)
 }
 
 func podTierLabel(podTier string) map[string]string {
@@ -362,7 +584,7 @@ func (c *ClientInfo) provisionPod(label, annotations map[string]string) (*core.P
 		return nil, err
 	}
 
-	if err := WaitForPodReady(c.Client, pod.Namespace, pod.Name, createTimeout); err != nil {
+	if err := WaitForPodReady(c.Client, pod.Namespace, pod.Name, podCreateTimeout); err != nil {
 		return nil, err
 	}
 
@@ -379,13 +601,13 @@ func (c *ClientInfo) deletePod(pod *core.Pod) error {
 		return err
 	}
 
-	if err := WaitForPodToDisappear(c.Client, pod.GetNamespace(), pod.GetName(), deleteTimeout); err != nil {
+	if err := WaitForPodToDisappear(c.Client, pod.GetNamespace(), pod.GetName(), podDeleteTimeout); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *ClientInfo) provisionStatefulSet(statefulSetName string, namespace string, serviceName string, replicas int, networkNames ...string) (*v1.StatefulSet, error) {
+func (c *ClientInfo) provisionStatefulSet(statefulSetName string, namespace string, serviceName string, replicas int, networkNames ...string) (*appsv1.StatefulSet, error) {
 	const statefulSetCreateTimeout = 6 * createTimeout
 	statefulSet, err := c.Client.AppsV1().StatefulSets(namespace).Create(
 		context.TODO(),
@@ -405,6 +627,47 @@ func (c *ClientInfo) provisionStatefulSet(statefulSetName string, namespace stri
 		return nil, err
 	}
 	return statefulSet, nil
+}
+
+func (c *ClientInfo) provisionReplicaSet(replicaCount int32, label, annotations map[string]string) (*appsv1.ReplicaSet, error) {
+	replicaSet, err := c.Client.AppsV1().ReplicaSets(testNamespace).Create(
+		context.Background(),
+		replicaSetObject(replicaCount, label, annotations),
+		metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := WaitForPodBySelector(c.Client, testNamespace, wbLabelEqual, rsCreateTimeout); err != nil {
+		return nil, err
+	}
+
+	replicaSet, err = c.Client.AppsV1().ReplicaSets(testNamespace).Get(context.Background(), replicaSet.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return replicaSet, nil
+}
+
+func (c *ClientInfo) updateReplicaSet(replicaSet *appsv1.ReplicaSet) (*appsv1.ReplicaSet, error) {
+	replicaSet, err := c.Client.AppsV1().ReplicaSets(testNamespace).Update(context.Background(), replicaSet, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return replicaSet, nil
+}
+
+func (c *ClientInfo) deleteReplicaSet(replicaSet *appsv1.ReplicaSet) error {
+	const rsDeleteTimeout = 2 * rsCreateTimeout
+	if err := c.Client.AppsV1().ReplicaSets(testNamespace).Delete(context.Background(), replicaSet.Name, metav1.DeleteOptions{}); err != nil {
+		return err
+	}
+
+	if err := WaitForReplicaSetToDisappear(c.Client, replicaSet.GetNamespace(), replicaSet.GetName(), rsDeleteTimeout); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *ClientInfo) deleteStatefulSet(namespace string, serviceName string, labelSelector string) error {
@@ -437,6 +700,41 @@ func (c *ClientInfo) scaleStatefulSet(statefulSetName string, namespace string, 
 	if _, err := c.Client.AppsV1().StatefulSets(namespace).Update(context.TODO(), statefulSet, metav1.UpdateOptions{}); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (v envVars) maxReplicas(allPods []core.Pod) int32 {
+	const maxPodsPerNode = 110
+	return int32(
+		(v.numComputeNodes*maxPodsPerNode - (len(allPods))) * v.fillPercentCapacity / 100)
+}
+
+// Waits for all replicas to be fully removed from replicaset, and checks that there are 0 ip pool allocations
+func checkZeroIPPoolAllocationsAndReplicas(clientInfo *ClientInfo, k8sIPAM *wbstorage.KubernetesIPAM, rsName, testNamespace string) error {
+	const (
+		emptyReplicaSet   = 0
+		rsSteadyTimeout   = 2 * rsCreateTimeout
+		zeroIPPoolTimeout = 2 * time.Minute
+	)
+	var err error
+
+	replicaSet, err := clientInfo.updateReplicaSet(replicaSetObject(
+		emptyReplicaSet,
+		podTierLabel(rsName),
+		podNetworkSelectionElements(testNetworkName),
+	))
+	if err != nil {
+		return err
+	}
+
+	if err = WaitForReplicaSetSteadyState(clientInfo.Client, testNamespace, wbLabelEqual, replicaSet, rsSteadyTimeout); err != nil {
+		return err
+	}
+
+	if err = WaitForZeroIPPoolAllocations(k8sIPAM, ipPoolName, zeroIPPoolTimeout); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -509,15 +807,15 @@ func podMeta(podName string, label map[string]string, annotations map[string]str
 	}
 }
 
-func statefulSetSpec(statefulSetName string, serviceName string, replicaNumber int, annotations map[string]string) *v1.StatefulSet {
+func statefulSetSpec(statefulSetName string, serviceName string, replicaNumber int, annotations map[string]string) *appsv1.StatefulSet {
 	const labelKey = "app"
 
 	replicas := int32(replicaNumber)
 	webAppLabels := map[string]string{labelKey: serviceName}
-	return &v1.StatefulSet{
+	return &appsv1.StatefulSet{
 		TypeMeta:   metav1.TypeMeta{},
 		ObjectMeta: metav1.ObjectMeta{Name: serviceName},
-		Spec: v1.StatefulSetSpec{
+		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: webAppLabels,
@@ -527,7 +825,45 @@ func statefulSetSpec(statefulSetName string, serviceName string, replicaNumber i
 				Spec:       podSpec(statefulSetName),
 			},
 			ServiceName:         serviceName,
-			PodManagementPolicy: v1.ParallelPodManagement,
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+		},
+	}
+}
+
+func replicaSetObject(replicaCount int32, label map[string]string, annotations map[string]string) *appsv1.ReplicaSet {
+	numReplicas := &replicaCount
+
+	return &appsv1.ReplicaSet{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ReplicaSet",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rsName,
+			Namespace: testNamespace,
+			Labels:    label,
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: numReplicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: label,
+			},
+			Template: core.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      label,
+					Annotations: annotations,
+					Namespace:   testNamespace,
+				},
+				Spec: core.PodSpec{
+					Containers: []core.Container{
+						{
+							Name:    "samplepod",
+							Command: containerCmd(),
+							Image:   testImage,
+						},
+					},
+				},
+			},
 		},
 	}
 }
