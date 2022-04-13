@@ -108,8 +108,6 @@ var _ = Describe("Whereabouts functionality", func() {
 			})
 
 			It("allocates a single pod within the correct IP range", func() {
-				const ipv4TestRange = "10.10.0.0/16"
-
 				By("checking pod IP is within whereabouts IPAM range")
 				secondaryIfaceIP, err := secondaryIfaceIPValue(pod)
 				Expect(err).NotTo(HaveOccurred())
