@@ -27,8 +27,6 @@ import (
 
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/api/whereabouts.cni.cncf.io/v1alpha1"
 	wbclient "github.com/k8snetworkplumbingwg/whereabouts/pkg/client/clientset/versioned"
-	"github.com/k8snetworkplumbingwg/whereabouts/pkg/logging"
-	"github.com/k8snetworkplumbingwg/whereabouts/pkg/reconciler"
 	wbstorage "github.com/k8snetworkplumbingwg/whereabouts/pkg/storage/kubernetes"
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/types"
 )
@@ -169,7 +167,7 @@ var _ = Describe("Whereabouts functionality", func() {
 
 					Expect(WaitForReplicaSetSteadyState(clientInfo.Client, testNamespace, wbLabelEqual, replicaSet, rsSteadyTimeout)).To(Succeed())
 
-					Expect(iPPoolConsistency(envVars.kubeconfigPath, k8sIPAM, clientInfo.Client)).To(Succeed())
+					Expect(iPPoolConsistency(k8sIPAM, clientInfo.Client)).To(Succeed())
 				}
 			})
 		})
@@ -364,13 +362,8 @@ var _ = Describe("Whereabouts functionality", func() {
 	})
 })
 
-func iPPoolConsistency(kubeconfigPath string, k8sIPAM *wbstorage.KubernetesIPAM, cs *kubernetes.Clientset) error {
+func iPPoolConsistency(k8sIPAM *wbstorage.KubernetesIPAM, cs *kubernetes.Clientset) error {
 	By("checking if there are any stale IPs in IP pool or any IPs in IP pool that are not seen attached to a pod")
-
-	By("Forcing reconciliation of the cluster...")
-	if err := runIpReconciler(kubeconfigPath); err != nil {
-		return err
-	}
 
 	By("Comparing pod ip assignments to ippool reservations")
 	ipPool, err := k8sIPAM.GetIPPool(context.Background(), ipPoolName)
@@ -927,30 +920,4 @@ func inRange(cidr string, ip string) error {
 	}
 
 	return fmt.Errorf("ip [%s] is NOT in range %s", ip, cidr)
-}
-
-func runIpReconciler(kubeconfigPath string) error {
-	const defaultReconcilerTimeout = 30
-
-	var err error
-	var ipReconcileLoop *reconciler.ReconcileLooper
-
-	logLevel := "error"
-
-	logging.SetLogLevel(logLevel)
-
-	ipReconcileLoop, err = reconciler.NewReconcileLooperWithKubeconfig(context.Background(), kubeconfigPath, defaultReconcilerTimeout)
-	if err != nil {
-		return fmt.Errorf("failed to create the reconcile looper: %v", err)
-	}
-
-	_, err = ipReconcileLoop.ReconcileIPPools(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to clean up IP for allocations: %v", err)
-	}
-
-	if err := ipReconcileLoop.ReconcileOverlappingIPAddresses(context.Background()); err != nil {
-		return fmt.Errorf("failed to reconcile clusterwide IPs: %v", err)
-	}
-	return nil
 }
