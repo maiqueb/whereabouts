@@ -126,11 +126,12 @@ var _ = Describe("Whereabouts functionality", func() {
 				By("creating a replicaset with whereabouts net-attach-def")
 				var err error
 
+				const ipPoolNamespace = "kube-system"
 				k8sIPAM, err = wbstorage.NewKubernetesIPAMWithNamespace("", types.IPAMConfig{
 					Kubernetes: types.KubernetesConfig{
 						KubeConfigPath: envVars.kubeconfigPath,
 					},
-				}, testNamespace)
+				}, ipPoolNamespace)
 				Expect(err).NotTo(HaveOccurred())
 
 				replicaSet, err = clientInfo.provisionReplicaSet(
