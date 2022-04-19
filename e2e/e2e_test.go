@@ -33,7 +33,7 @@ import (
 
 const (
 	wbLabelEqual     = "tier=whereabouts-scale-test"
-	testNamespace    = "kube-system"
+	testNamespace    = "default"
 	createTimeout    = 10 * time.Second
 	deleteTimeout    = 2 * createTimeout
 	rsCreateTimeout  = 600 * time.Second
